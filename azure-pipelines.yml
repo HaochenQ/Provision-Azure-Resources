@@ -1,0 +1,229 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger:
+  batch: 'true'
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+name: Deploy Bicep files
+
+variables:
+  vmImageName: 'windows-latest'
+  vmLinuxName: 'ubuntu-latest'
+  azureServiceConnection: 'YOUR-ARM-CONNECTION'
+  testResourceGroupName: 'YOUR-DEV-RG'
+  prodResourceGroupName: 'YOUR-PROD-RG'
+  location: 'Australia East'
+  templateFile: 'infra/main.bicep'
+  testParamFile: 'infra/main.test.bicepparam'
+  prodParamFile: 'infra/main.prod.bicepparam'
+  codeSrcPath: 'src/azure-integration'
+  testDeploymentName: 'Test-Azure-Resource-Deployment'
+  prodDeploymentName: 'Prod-Azure-Resource-Deployment'
+
+pool:
+  vmImage: $(vmImageName)
+
+stages:
+  - stage: Build_Function
+    # pool:
+    #   vmImage: 'windows-latest'
+    jobs:
+      - job: Job_Build_Func_CSProj
+        steps:
+          # - task: DotNetCoreCLI@2
+          #   inputs:
+          #     command: 'build'
+          #     projects: '$(codeSrcPath)'
+          #     arguments: '--configuration Release'
+          - task: DotNetCoreCLI@2
+            inputs:
+              command: publish
+              arguments: '--configuration Release --output publish_output'
+              projects: $(codeSrcPath)
+              publishWebProjects: false
+              modifyOutputPath: false
+              zipAfterPublish: false
+          - task: ArchiveFiles@2
+            displayName: Archive files
+            inputs:
+              rootFolderOrFile: '$(System.DefaultWorkingDirectory)/publish_output'
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: '$(System.DefaultWorkingDirectory)/build$(Build.BuildId).zip'
+              replaceExistingArchive: true
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(System.DefaultWorkingDirectory)/build$(Build.BuildId).zip'
+              artifactName: 'drop'
+
+  - stage: Test_Infra
+    pool:
+      vmImage: $(vmLinuxName)
+    jobs:
+      - job: Infra_Build
+        steps:
+          - task: AzureCLI@2
+            displayName: Deploy Bicep Template
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az --version
+                az deployment group create \
+                  --resource-group $(testResourceGroupName) \
+                  --template-file $(templateFile) \
+                  --parameters $(testParamFile) \
+                  --name $(testDeploymentName)
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                export FUNC_NAME=$(az deployment group show \
+                  -g $(testResourceGroupName) \
+                  -n $(testDeploymentName) \
+                  --query properties.outputs.function_app_name.value \
+                  -o tsv)
+                echo "##vso[task.setvariable variable=testFuncAppName;isOutput=true]$FUNC_NAME"
+                az deployment group show \
+                  -g $(testResourceGroupName) \
+                  -n $(testDeploymentName) \
+                  --query properties.outputs \
+                  -o json | tee $(System.DefaultWorkingDirectory)/test-outputs.json
+            name: bicepOutputs
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: '$(System.DefaultWorkingDirectory)/test-outputs.json'
+              artifact: 'Test-Bicep-Output'
+              publishLocation: 'pipeline'
+
+  # - stage: Build
+  #   dependsOn: [Infra]
+  #   jobs:
+  #     - job: Publish_Functions
+  #       variables:
+  #         FUNC_APP_NAME: $[stageDependencies.Infra.Infra_Build.outputs['bicepOutputs.testFuncAppName']]
+  #       steps:
+  #         - task: FuncToolsInstaller@0
+  #           inputs:
+  #             version: 'latest'
+
+  #         - task: AzureCLI@2
+  #           inputs:
+  #             azureSubscription: '$(azureServiceConnection)'
+  #             scriptType: 'bash'
+  #             scriptLocation: 'inlineScript'
+  #             inlineScript: |
+  #               cd ./src/azure-integration
+  #               func azure functionapp publish $(FUNC_APP_NAME) --csharp
+
+  - stage: Test_Publish_Function
+    dependsOn: [Build_Function, Test_Infra]
+    # pool:
+    #   vmImage: 'windows-latest'
+    jobs:
+      - job: Job_Publish_Function
+        variables:
+          FUNC_NAME: $[stageDependencies.Test_Infra.Infra_Build.outputs['bicepOutputs.testFuncAppName']]
+        steps:
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'drop'
+              itemPattern: '**/*.zip'
+              downloadPath: '$(System.ArtifactsDirectory)'
+
+          - task: AzureFunctionApp@2
+            inputs:
+              connectedServiceNameARM: $(azureServiceConnection)
+              appType: 'functionApp'
+              appName: $(FUNC_NAME)
+              package: '$(System.ArtifactsDirectory)/**/*.zip'
+              deploymentMethod: 'auto'
+
+  - stage: Prod_Publish_Function
+    dependsOn: Test_Publish_Function
+    condition: succeeded()
+    jobs:
+      - job: Manual_Validation
+        pool: server
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 1440 # task times out in 1 day
+            inputs:
+              notifyUsers: 'xxx@xxx.com.au'
+              instructions: 'Please validate the build and resume the pipeline to deploy to prod.'
+              onTimeout: reject
+      - job: Provision_Prod_Resource
+        pool:
+          vmImage: $(vmLinuxName)
+        steps:
+          - task: AzureCLI@2
+            displayName: Deploy Bicep Template
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az --version
+                az deployment group create \
+                  --resource-group $(prodResourceGroupName) \
+                  --template-file $(templateFile) \
+                  --parameters $(prodParamFile) \
+                  --name $(prodDeploymentName)
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                export FUNC_NAME=$(az deployment group show \
+                  -g $(prodResourceGroupName) \
+                  -n $(prodDeploymentName) \
+                  --query properties.outputs.function_app_name.value \
+                  -o tsv)
+                echo "##vso[task.setvariable variable=ProdfuncAppName;isOutput=true]$FUNC_NAME"
+                az deployment group show \
+                  -g $(prodResourceGroupName) \
+                  -n $(prodDeploymentName) \
+                  --query properties.outputs \
+                  -o json | tee $(System.DefaultWorkingDirectory)/prod-outputs.json
+            name: bicepOutputs
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: '$(System.DefaultWorkingDirectory)/prod-outputs.json'
+              artifact: 'Prod-Bicep-Output'
+              publishLocation: 'pipeline'
+
+      - job: Publish_Prod_Function
+        dependsOn: Provision_Prod_Resource
+        variables:
+          FUNC_NAME: $[dependencies.Provision_Prod_Resource.outputs['bicepOutputs.ProdfuncAppName']]
+        steps:
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'drop'
+              itemPattern: '**/*.zip'
+              downloadPath: '$(System.ArtifactsDirectory)'
+          - task: AzureFunctionApp@2
+            inputs:
+              connectedServiceNameARM: $(azureServiceConnection)
+              appType: 'functionApp'
+              appName: $(FUNC_NAME)
+              package: '$(System.ArtifactsDirectory)/**/*.zip'
+              deploymentMethod: 'auto'
